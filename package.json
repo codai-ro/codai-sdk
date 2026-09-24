@@ -1,0 +1,59 @@
+{
+  "name": "codai-sdk",
+  "version": "0.3.1",
+  "description": "Official TypeScript SDK for the codai AI gateway - chat, messages, responses, streaming, agents, tasks, sessions, devices, hosts, orgs, account.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "provenance": true
+  },
+  "keywords": [
+    "codai",
+    "ai",
+    "llm",
+    "openai-compatible",
+    "gateway",
+    "agents"
+  ],
+  "homepage": "https://codai.ro",
+  "bugs": "https://github.com/codai-ro/codai-sdk/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/codai-ro/codai-sdk.git"
+  },
+  "scripts": {
+    "lint": "echo 'lint runs in the codai monorepo'",
+    "typecheck": "tsc --noEmit",
+    "build": "tsup",
+    "test": "vitest run",
+    "clean": "rm -rf .turbo dist",
+    "test:coverage": "vitest run --coverage",
+    "smoke:local": "tsx scripts/smoke-local.ts"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^5.0.1",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.1",
+    "@types/node": "^22.19.19"
+  }
+}
