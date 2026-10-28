@@ -1,0 +1,614 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
+import {
+  CodaiError,
+  Codai,
+  vaultResolveDigestInput,
+  vaultResolveMessage,
+  vaultUnlockMessage,
+  vaultApproveMessageV4,
+} from '../index';
+
+const ITEM = '0b7d1a2e-1111-4222-8333-444455556666';
+
+interface Call {
+  url: string;
+  method: string;
+  body: unknown;
+}
+
+function stub(replies: { status: number; body: unknown }[]): Call[] {
+  const calls: Call[] = [];
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (url: string, init: RequestInit = {}) => {
+      calls.push({
+        url,
+        method: String(init.method),
+        body: init.body === undefined ? undefined : JSON.parse(String(init.body)),
+      });
+      const r = replies.shift() ?? { status: 200, body: { ok: true } };
+      return new Response(JSON.stringify(r.body), {
+        status: r.status,
+        headers: { 'content-type': 'application/json' },
+      });
+    }),
+  );
+  return calls;
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe('vault (V-05 SDK)', () => {
+  it('maps account, items, cloud copy and rules to their routes with ciphertext-only bodies', async () => {
+    const calls = stub([]);
+    const v = new Codai({ apiKey: 'sk-test', maxRetries: 2 }).vault;
+    await v.putAccount({ bundle: { slots: [] }, revision: 2 });
+    await v.setDefaultTier('t2');
+    await v.items({ since: '2026-10-18T00:00:00Z' });
+    await v.putItem(ITEM, {
+      id: ITEM,
+      vault_id: ITEM,
+      revision: 1,
+      wrapped_key: 'w',
+      ciphertext: 'c',
+      kind: 'login',
+    });
+    await v.setItemCloud(ITEM, null);
+    await v.deleteItem(ITEM);
+    await v.createRule({ tier: 't1', agent: 'codaid*' });
+    await v.events({ limit: 5 });
+    expect(calls.map((c) => `${c.method} ${c.url.replace('https://ai.codai.ro', '')}`)).toEqual([
+      'PUT /v1/vault/account',
+      'PATCH /v1/vault/settings',
+      'GET /v1/vault/items?since=2026-10-18T00%3A00%3A00Z',
+      `PUT /v1/vault/items/${ITEM}`,
+      `PUT /v1/vault/items/${ITEM}/cloud`,
+      `DELETE /v1/vault/items/${ITEM}`,
+      'POST /v1/vault/rules',
+      'GET /v1/vault/events?limit=5',
+    ]);
+    expect(calls[1]!.body).toEqual({ default_tier: 't2' });
+    expect(calls[4]!.body).toEqual({ item: null });
+  });
+
+  it('broker: use -> approval -> decide, and a 202 from http/resolve is a result, not an error', async () => {
+    const calls = stub([
+      {
+        status: 200,
+        body: { tier: 't3', allowed: false, reasons: ['approval'], approval_id: 'a 1' },
+      },
+      { status: 200, body: { status: 'approved' } },
+      { status: 202, body: { approval_id: 'a2' } },
+      { status: 202, body: { approvals: ['a3'] } },
+    ]);
+    const v = new Codai({ apiKey: 'sk-test', maxRetries: 2 }).vault;
+    const d = await v.use({ handle: 'github', mode: 'http', action: 'push', host: undefined });
+    expect(d.approval_id).toBe('a 1');
+    expect(calls[0]!.body).toEqual({ handle: 'github', mode: 'http', action: 'push' });
+    await v.decide('a 1', { decision: 'approve', scope: 'once', signature: 'sig' });
+    expect(calls[1]!.url).toBe('https://ai.codai.ro/v1/vault/approvals/a%201/decide');
+    expect(await v.httpCall({ handle: 'github', url: 'https://api.github.com/user' })).toEqual({
+      approval_id: 'a2',
+    });
+    const proof = { device_id: 'cli-abcd1234', challenge: 'ch123', signature: 'sig' };
+    expect(await v.resolve({ handles: ['db'], action: 'run', proof })).toEqual({
+      approvals: ['a3'],
+    });
+    expect(calls[3]!.body).toEqual({ handles: ['db'], action: 'run', proof });
+    // Mutations are never retried (one fetch each).
+    expect(calls).toHaveLength(4);
+  });
+
+  it('resolveChallenge maps to POST /v1/vault/resolve/challenge; proof message matches the contract vector', async () => {
+    const calls = stub([
+      { status: 200, body: { challenge: 'ch123', expires_at: '2026-10-24T00:02:00Z' } },
+    ]);
+    const v = new Codai({ apiKey: 'sk-test', maxRetries: 2 }).vault;
+    const ch = await v.resolveChallenge();
+    expect(calls.map((c) => [c.method, c.url, c.body])).toEqual([
+      ['POST', 'https://ai.codai.ro/v1/vault/resolve/challenge', {}],
+    ]);
+    const digest = createHash('sha256')
+      .update(
+        vaultResolveDigestInput(['github.token', 'aws.secret'], 'curl -H x https://api.github.com'),
+      )
+      .digest('base64url');
+    expect(digest).toBe('D_gl7EO9sGs-oo2tDZhv6JDMLE3vQ2Vo9jwdFPZRKdQ');
+    expect(vaultResolveMessage(ch.challenge, 'cli-abcd1234', digest)).toBe(
+      'codai-vault/resolve/v1|ch123|cli-abcd1234|D_gl7EO9sGs-oo2tDZhv6JDMLE3vQ2Vo9jwdFPZRKdQ',
+    );
+  });
+
+  it('devices: challenge -> enroll -> list -> rename -> revoke map to /v1/vault/devices and unwrap replies', async () => {
+    const device = {
+      id: 'android-pixel.9a',
+      kind: 'android_keystore',
+      name: 'Pixel',
+      surface: 'phone',
+      public_key: 'spki',
+      attestation: 'android-strongbox',
+      attestation_info: {},
+      created_at: '2026-10-19T00:00:00Z',
+      last_used_at: null,
+      revoked_at: null,
+    };
+    const calls = stub([
+      { status: 200, body: { nonce: 'n0', expires_at: '2026-10-19T00:05:00Z' } },
+      { status: 201, body: { device } },
+      { status: 200, body: { devices: [device] } },
+      { status: 200, body: { device: { ...device, name: 'Phone' } } },
+      { status: 200, body: { ok: true } },
+    ]);
+    const d = new Codai({ apiKey: 'sk-test', maxRetries: 2 }).vault.devices;
+    const ch = await d.challenge();
+    expect(ch.nonce).toBe('n0');
+    const enrolled = await d.enroll({
+      device_id: device.id,
+      kind: 'android_keystore',
+      name: 'Pixel',
+      surface: 'phone',
+      public_key: 'spki',
+      nonce: ch.nonce,
+      vault_signature: 'vs',
+      device_signature: 'ds',
+      attestation: { android_chain: ['leaf', 'root'] },
+    });
+    expect(enrolled.attestation).toBe('android-strongbox');
+    expect((await d.list()).map((x) => x.id)).toEqual([device.id]);
+    expect((await d.rename(device.id, 'Phone')).name).toBe('Phone');
+    expect(await d.revoke(device.id)).toEqual({ ok: true });
+    expect(calls.map((c) => `${c.method} ${c.url.replace('https://ai.codai.ro', '')}`)).toEqual([
+      'POST /v1/vault/devices/challenge',
+      'POST /v1/vault/devices',
+      'GET /v1/vault/devices',
+      `PATCH /v1/vault/devices/${device.id}`,
+      `DELETE /v1/vault/devices/${device.id}`,
+    ]);
+    expect(calls[0]!.body).toEqual({});
+    expect(calls[1]!.body).toMatchObject({
+      nonce: 'n0',
+      attestation: { android_chain: ['leaf', 'root'] },
+    });
+    expect(calls[3]!.body).toEqual({ name: 'Phone' });
+  });
+
+  it('decide sends a v2 device or passkey proof instead of a v1 signature, and a bare deny', async () => {
+    const calls = stub([]);
+    const v = new Codai({ apiKey: 'sk-test', maxRetries: 2 }).vault;
+    await v.decide('a1', {
+      decision: 'approve',
+      scope: 'once',
+      via: 'phone',
+      proof: { type: 'device', device_id: 'android-pixel.9a', signature: 'sig' },
+    });
+    await v.decide('a1', {
+      decision: 'approve',
+      scope: '1h',
+      proof: { type: 'passkey', response: { id: 'cred', type: 'public-key' } },
+    });
+    await v.decide('a1', { decision: 'deny', scope: 'once', via: 'phone' });
+    expect(calls.map((c) => c.body)).toEqual([
+      {
+        decision: 'approve',
+        scope: 'once',
+        via: 'phone',
+        proof: { type: 'device', device_id: 'android-pixel.9a', signature: 'sig' },
+      },
+      {
+        decision: 'approve',
+        scope: '1h',
+        proof: { type: 'passkey', response: { id: 'cred', type: 'public-key' } },
+      },
+      { decision: 'deny', scope: 'once', via: 'phone' },
+    ]);
+  });
+
+  it('v4 guards: settings, lock, unlock, limits and revoke-task map to their routes and unwrap replies', async () => {
+    const guards = {
+      new_host: true,
+      burst_max: 3,
+      burst_window_s: 60,
+      hour_start: 7,
+      hour_end: 23,
+      tz: 'Europe/Bucharest',
+    };
+    const lim = { item_id: ITEM, per_minute: 5, per_day: null, units_per_day: 200 };
+    const calls = stub([
+      { status: 200, body: { default_tier: 't3', guards } },
+      {
+        status: 200,
+        body: { locked_at: '2026-10-20T10:00:00Z', grants_revoked: 2, approvals_denied: 1 },
+      },
+      {
+        status: 200,
+        body: { challenge: 'c0', expires_at: '2026-10-20T10:05:00Z', message_template: 't' },
+      },
+      { status: 200, body: { unlocked: true } },
+      { status: 200, body: { limits: [lim] } },
+      { status: 200, body: { limits: lim } },
+      { status: 200, body: { limits: null } },
+      { status: 200, body: { revoked: 3 } },
+    ]);
+    const v = new Codai({ apiKey: 'sk-test', maxRetries: 2 }).vault;
+    expect((await v.updateSettings({ guards: { burst_max: 3 } })).guards.burst_max).toBe(3);
+    expect((await v.lock({ via: 'phone' })).grants_revoked).toBe(2);
+    const ch = await v.unlockChallenge();
+    expect(vaultUnlockMessage(ch.challenge, 'android-pixel.9a')).toBe(
+      'codai-vault/unlock/v1|c0|android-pixel.9a',
+    );
+    expect(
+      await v.unlock({
+        challenge: ch.challenge,
+        proof: { type: 'device', device_id: 'android-pixel.9a', signature: 'sig' },
+        via: 'phone',
+      }),
+    ).toEqual({ unlocked: true });
+    expect(await v.limits()).toEqual([lim]);
+    expect(await v.setLimits(ITEM, { per_minute: 5, per_day: null, units_per_day: 200 })).toEqual(
+      lim,
+    );
+    expect(
+      await v.setLimits(ITEM, { per_minute: null, per_day: null, units_per_day: null }),
+    ).toBeNull();
+    expect(await v.revokeTaskGrants('task-1')).toEqual({ revoked: 3 });
+    expect(calls.map((c) => `${c.method} ${c.url.replace('https://ai.codai.ro', '')}`)).toEqual([
+      'PATCH /v1/vault/settings',
+      'POST /v1/vault/lock',
+      'POST /v1/vault/unlock/challenge',
+      'POST /v1/vault/unlock',
+      'GET /v1/vault/limits',
+      `PUT /v1/vault/items/${ITEM}/limits`,
+      `PUT /v1/vault/items/${ITEM}/limits`,
+      'POST /v1/vault/grants/revoke-task',
+    ]);
+    expect(calls.map((c) => c.body)).toEqual([
+      { guards: { burst_max: 3 } },
+      { via: 'phone' },
+      {},
+      {
+        challenge: 'c0',
+        proof: { type: 'device', device_id: 'android-pixel.9a', signature: 'sig' },
+        via: 'phone',
+      },
+      undefined,
+      { per_minute: 5, per_day: null, units_per_day: 200 },
+      { per_minute: null, per_day: null, units_per_day: null },
+      { task: 'task-1' },
+    ]);
+    await expect(v.updateSettings({})).rejects.toThrow(TypeError);
+  });
+
+  it('lock without via sends an empty body; 429 vault_rate_limited surfaces code + Retry-After', async () => {
+    const calls: { body: unknown }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init: RequestInit = {}) => {
+        calls.push({ body: init.body === undefined ? undefined : JSON.parse(String(init.body)) });
+        if (calls.length === 1)
+          return new Response(
+            JSON.stringify({ locked_at: 'x', grants_revoked: 0, approvals_denied: 0 }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        return new Response(
+          JSON.stringify({
+            error: { code: 'vault_rate_limited', type: 'rate_limit_error', message: 'cap' },
+          }),
+          { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '60' } },
+        );
+      }),
+    );
+    const v = new Codai({ apiKey: 'sk-test', maxRetries: 0 }).vault;
+    await v.lock();
+    expect(calls[0]!.body).toEqual({});
+    const err = await v
+      .use({ handle: 'github', mode: 'http', action: 'push' })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CodaiError);
+    expect((err as CodaiError).status).toBe(429);
+    expect((err as CodaiError).code).toBe('vault_rate_limited');
+    expect((err as CodaiError).retryAfter).toBe(60);
+  });
+});
+
+describe('vault wave 2 (V-15, V-17, V-20, V-23)', () => {
+  const route = (c: Call) => `${c.method} ${c.url.replace('https://ai.codai.ro', '')}`;
+
+  it('add requests: create, poll, lookup, complete, cancel', async () => {
+    const calls = stub([
+      { status: 201, body: { id: 'r1', url: 'https://hub/x', status: 'pending', expires_at: 'e' } },
+    ]);
+    const a = new Codai({ apiKey: 'sk-test' }).vault.addRequests;
+    const created = await a.create({
+      kind: 'api_key',
+      title: 'Stripe',
+      purpose: 'charge a test card',
+      hosts: ['api.stripe.com'],
+      slug: undefined,
+    });
+    expect(created.url).toBe('https://hub/x');
+    await a.get('r 1');
+    await a.lookup('t'.repeat(43));
+    await a.complete('r1', ITEM);
+    await a.cancel('r1');
+    expect(calls.map(route)).toEqual([
+      'POST /v1/vault/add-requests',
+      'GET /v1/vault/add-requests/r%201',
+      'POST /v1/vault/add-requests/lookup',
+      'POST /v1/vault/add-requests/r1/complete',
+      'DELETE /v1/vault/add-requests/r1',
+    ]);
+    expect(calls[0]!.body).toEqual({
+      kind: 'api_key',
+      title: 'Stripe',
+      purpose: 'charge a test card',
+      hosts: ['api.stripe.com'],
+    });
+    expect(calls[2]!.body).toEqual({ token: 't'.repeat(43) });
+    expect(calls[3]!.body).toEqual({ item_id: ITEM });
+  });
+
+  it('emergency access: full lifecycle routes and bodies', async () => {
+    const calls = stub([]);
+    const e = new Codai({ apiKey: 'sk-test' }).vault.emergency;
+    const sealed = {
+      [ITEM]: { alg: 'xwing-hkdf-xchacha20poly1305' as const, ct: 'c'.repeat(16), wrapped: 'w' },
+    };
+    await e.list();
+    await e.invite({ email: 'a@b.ro', delay_hours: 48 });
+    await e.accept('t'.repeat(43));
+    await e.seal('c1', { grantee_fingerprint: 'fp-12345678', sealed_keys: sealed });
+    await e.update('c1', { delay_hours: 72 });
+    await e.request('c1');
+    await e.request('c1', { reason: 'hospital' });
+    await e.deny('c1');
+    await e.approve('c1');
+    await e.vaultData('c1');
+    await e.revoke('c1');
+    expect(calls.map(route)).toEqual([
+      'GET /v1/vault/emergency',
+      'POST /v1/vault/emergency',
+      'POST /v1/vault/emergency/accept',
+      'PUT /v1/vault/emergency/c1/seal',
+      'PATCH /v1/vault/emergency/c1',
+      'POST /v1/vault/emergency/c1/request',
+      'POST /v1/vault/emergency/c1/request',
+      'POST /v1/vault/emergency/c1/deny',
+      'POST /v1/vault/emergency/c1/approve',
+      'GET /v1/vault/emergency/c1/vault-data',
+      'DELETE /v1/vault/emergency/c1',
+    ]);
+    expect(calls[1]!.body).toEqual({ email: 'a@b.ro', delay_hours: 48 });
+    expect(calls[3]!.body).toEqual({ grantee_fingerprint: 'fp-12345678', sealed_keys: sealed });
+    expect(calls[5]!.body).toEqual({});
+    expect(calls[6]!.body).toEqual({ reason: 'hospital' });
+    await expect(e.update('c1', {})).rejects.toThrow(TypeError);
+  });
+
+  it('rotation + HIBP: text range, queue, schedule, rotated, breach report', async () => {
+    const seen: { url: string; method: string; accept: string | null; body: unknown }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const h = new Headers(init.headers);
+        seen.push({
+          url: url.replace('https://ai.codai.ro', ''),
+          method: String(init.method),
+          accept: h.get('accept'),
+          body: init.body === undefined ? undefined : JSON.parse(String(init.body)),
+        });
+        if (url.includes('/hibp/'))
+          return new Response(
+            '0018A45C4D1DEF81644B54AB7F969B88D65:3\r\n00D4F6E8FA6EECAD2A3AA415EEC418D38EC:0',
+            {
+              status: 200,
+              headers: { 'content-type': 'text/plain; charset=utf-8' },
+            },
+          );
+        if (url.endsWith('/v1/vault/rotation'))
+          return Response.json({ items: [{ item_id: ITEM, breached: true }] });
+        return Response.json({ recorded: 1, newly_breached: 1 });
+      }),
+    );
+    const v = new Codai({ apiKey: 'sk-test' }).vault;
+    const text = await v.hibpRange('21bd1');
+    expect(text.split('\r\n')[0]).toBe('0018A45C4D1DEF81644B54AB7F969B88D65:3');
+    await expect(v.hibpRange('xyz')).rejects.toThrow(TypeError);
+    expect((await v.rotation())[0]!.item_id).toBe(ITEM);
+    await v.setRotation(ITEM, { interval_days: 30, snoozed_until: null, provider: undefined });
+    await v.markRotated(ITEM);
+    expect(await v.reportBreaches([{ item_id: ITEM, count: 3 }])).toEqual({
+      recorded: 1,
+      newly_breached: 1,
+    });
+    await expect(v.setRotation(ITEM, {})).rejects.toThrow(TypeError);
+    expect(seen.map((s) => `${s.method} ${s.url}`)).toEqual([
+      'GET /v1/vault/hibp/range/21BD1',
+      'GET /v1/vault/rotation',
+      `PUT /v1/vault/items/${ITEM}/rotation`,
+      `POST /v1/vault/items/${ITEM}/rotated`,
+      'POST /v1/vault/rotation/breach-report',
+    ]);
+    expect(seen[0]!.accept).toBe('text/plain');
+    expect(seen[2]!.body).toEqual({ interval_days: 30, snoozed_until: null });
+    expect(seen[4]!.body).toEqual({ results: [{ item_id: ITEM, count: 3 }] });
+  });
+
+  it('derivers: list, set, delete, and derive returns 202 approvals instead of throwing', async () => {
+    const deriver = {
+      item_id: ITEM,
+      provider: 'aws_sts',
+      config: { role_arn: 'arn:aws:iam::1:role/x' },
+      max_ttl_s: 3600,
+      updated_at: 'u',
+    };
+    const calls = stub([
+      { status: 200, body: { derivers: [deriver] } },
+      { status: 200, body: { deriver } },
+      { status: 200, body: { deleted: true } },
+      {
+        status: 202,
+        body: {
+          status: 'approval_required',
+          tier: 't3',
+          approval_id: 'a1',
+          match_number: '42',
+          reasons: [],
+        },
+      },
+    ]);
+    const v = new Codai({ apiKey: 'sk-test' }).vault;
+    expect(await v.derivers()).toEqual([deriver]);
+    expect(
+      await v.setDeriver(ITEM, { provider: 'aws_sts', config: deriver.config, max_ttl_s: 3600 }),
+    ).toEqual(deriver);
+    expect(await v.deleteDeriver(ITEM)).toEqual({ deleted: true });
+    const proof = { device_id: 'cli-abcd', challenge: 'c', signature: 's' };
+    const r = await v.derive({ handle: '{{vault:aws}}', action: 'deploy', proof, ttl_s: 900 });
+    expect(r).toMatchObject({ status: 'approval_required', approval_id: 'a1' });
+    expect(calls.map(route)).toEqual([
+      'GET /v1/vault/derivers',
+      `PUT /v1/vault/items/${ITEM}/deriver`,
+      `DELETE /v1/vault/items/${ITEM}/deriver`,
+      'POST /v1/vault/derive',
+    ]);
+    expect(calls[3]!.body).toEqual({
+      handle: '{{vault:aws}}',
+      action: 'deploy',
+      proof,
+      ttl_s: 900,
+    });
+  });
+});
+
+describe('vault wave 3 (V-33, V-16, V-36)', () => {
+  const route = (c: Call) => `${c.method} ${c.url.replace('https://ai.codai.ro', '')}`;
+  const USER = '9a9a9a9a-1111-4222-8333-444455556666';
+  const sealed = {
+    alg: 'xwing-hkdf-xchacha20poly1305' as const,
+    ct: 'c'.repeat(16),
+    wrapped: 'v1.n.c',
+  };
+
+  it('org vault members: list, candidates, add, update, remove', async () => {
+    const member = {
+      user_id: USER,
+      email: 'a@b.ro',
+      name: 'A',
+      role: 'editor',
+      fingerprint: 'fp',
+      key_epoch: 1,
+      added_at: 't',
+    };
+    const calls = stub([
+      { status: 200, body: { members: [member] } },
+      {
+        status: 200,
+        body: {
+          candidates: [
+            {
+              user_id: USER,
+              email: null,
+              name: null,
+              fingerprint: 'fp',
+              public_keys: { kem: 'k', sign: 's' },
+            },
+          ],
+        },
+      },
+    ]);
+    const m = new Codai({ apiKey: 'sk-test' }).vault.members;
+    expect(await m.list(ITEM)).toEqual([member]);
+    expect((await m.candidates(ITEM))[0]!.fingerprint).toBe('fp');
+    await m.add(ITEM, USER, { role: 'editor', sealed_key: sealed, fingerprint: 'fp-12345678' });
+    await m.update(ITEM, USER, 'viewer');
+    await m.remove(ITEM, USER);
+    expect(calls.map(route)).toEqual([
+      `GET /v1/vault/vaults/${ITEM}/members`,
+      `GET /v1/vault/vaults/${ITEM}/candidates`,
+      `PUT /v1/vault/vaults/${ITEM}/members/${USER}`,
+      `PATCH /v1/vault/vaults/${ITEM}/members/${USER}`,
+      `DELETE /v1/vault/vaults/${ITEM}/members/${USER}`,
+    ]);
+    expect(calls[2]!.body).toEqual({
+      role: 'editor',
+      sealed_key: sealed,
+      fingerprint: 'fp-12345678',
+    });
+    expect(calls[3]!.body).toEqual({ role: 'viewer' });
+  });
+
+  it('rotateKey, setQuorum (on/off), vote, simulatePolicy, receiptKeys, digest opt-out', async () => {
+    const calls = stub([
+      { status: 200, body: { key_epoch: 3 } },
+      { status: 200, body: { quorum: { m: 2, scope: 'critical' } } },
+      { status: 200, body: { quorum: null } },
+      {
+        status: 200,
+        body: { status: 'pending', quorum: { m: 2, approvals: 1, needed: 1, voted: true } },
+      },
+      { status: 200, body: { evaluated: 4, changed: 1, grants: 'none', rows: [] } },
+      {
+        status: 200,
+        body: {
+          keys: [{ kid: 'projects/p/k/1', alg: 'ES256', pem: '-----BEGIN PUBLIC KEY-----' }],
+        },
+      },
+      { status: 200, body: { default_tier: 't3', guards: {}, digest_opt_out: true } },
+    ]);
+    const v = new Codai({ apiKey: 'sk-test' }).vault;
+    const rot = {
+      key_epoch: 3,
+      encrypted_meta: 'v1.n.c',
+      members: [{ user_id: USER, sealed_key: sealed }],
+      items: [{ id: ITEM, revision: 4, wrapped_key: 'v1.a.b', ciphertext: 'v1.c.d' }],
+    };
+    expect(await v.rotateKey(ITEM, rot)).toEqual({ key_epoch: 3 });
+    await v.setQuorum(ITEM, { m: 2, scope: 'critical' });
+    await v.setQuorum(ITEM, null);
+    const proof = { type: 'device' as const, device_id: 'android-abcd', signature: 's' };
+    const vote = await v.vote('ap1', { decision: 'approve', proof });
+    expect(vote.quorum.needed).toBe(1);
+    const sim = await v.simulatePolicy({ rules: [{ tier: 't4', agent: 'codaid*' }], limit: 50 });
+    expect(sim.grants).toBe('none');
+    expect((await v.receiptKeys())[0]!.alg).toBe('ES256');
+    await v.updateSettings({ digest_opt_out: true });
+    expect(calls.map(route)).toEqual([
+      `POST /v1/vault/vaults/${ITEM}/rotate`,
+      `PUT /v1/vault/vaults/${ITEM}/quorum`,
+      `PUT /v1/vault/vaults/${ITEM}/quorum`,
+      'POST /v1/vault/approvals/ap1/vote',
+      'POST /v1/vault/policy/simulate',
+      'GET /v1/vault/receipts/keys',
+      'PATCH /v1/vault/settings',
+    ]);
+    expect(calls[0]!.body).toEqual(rot);
+    expect(calls[1]!.body).toEqual({ m: 2, scope: 'critical' });
+    expect(calls[2]!.body).toEqual({ m: null });
+    expect(calls[3]!.body).toEqual({ decision: 'approve', proof });
+    expect(calls[4]!.body).toEqual({ rules: [{ tier: 't4', agent: 'codaid*' }], limit: 50 });
+    expect(calls[6]!.body).toEqual({ digest_opt_out: true });
+  });
+
+  it('decide on a quorum approval surfaces 409 quorum_required; approve/v4 message matches the ADR', async () => {
+    stub([{ status: 409, body: { error: { code: 'quorum_required', message: 'vote instead' } } }]);
+    const v = new Codai({ apiKey: 'sk-test', maxRetries: 0 }).vault;
+    const err = await v
+      .decide('ap1', { decision: 'approve', scope: 'once', via: 'qr' })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CodaiError);
+    expect((err as CodaiError).code).toBe('quorum_required');
+    expect(
+      vaultApproveMessageV4({
+        approvalId: 'ap1',
+        actionHash: 'h',
+        decision: 'deny',
+        approverUserId: USER,
+        deviceIdOrPasskey: 'passkey',
+        previewDigest: 'd',
+      }),
+    ).toBe(`codai-vault/approve/v4|ap1|h|deny|once|${USER}|passkey|d`);
+  });
+});
